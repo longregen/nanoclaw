@@ -49,12 +49,46 @@ AskUserQuestion: Which groups should have access to X tools?
 
 ## Phase 2: Apply Code Changes
 
-### Prerequisites
+Run the skills engine to apply this skill's code package. The package files are in this directory alongside this SKILL.md.
 
-Ensure NanoClaw is installed and running, then install dependencies:
+### Initialize skills system (if needed)
+
+If `.nanoclaw/` directory doesn't exist yet:
 
 ```bash
-npm ls playwright dotenv-cli || npm install playwright dotenv-cli
+npx tsx scripts/apply-skill.ts --init
+```
+
+### Apply the skill
+
+```bash
+npx tsx scripts/apply-skill.ts .claude/skills/add-x-twitter-integration
+```
+
+This deterministically:
+- Three-way merges X IPC handler into `src/ipc.ts` (adds `handleXIpc` import and switch default routing)
+- Three-way merges X MCP tools into `container/agent-runner/src/ipc-mcp-stdio.ts` (registers `x_post`, `x_like`, `x_reply`, `x_retweet`, `x_quote` tools)
+- Three-way merges build context change into `container/build.sh` (project root context)
+- Three-way merges Dockerfile changes into `container/Dockerfile` (build context paths, x_results workspace directory)
+- Installs `playwright` and `dotenv-cli` npm dependencies
+- Updates `.env.example` with `CHROME_PATH`, `X_ENABLED_ACTIONS`, `X_REQUIRE_CONFIRMATION`, `X_MAIN_ONLY`
+- Records the application in `.nanoclaw/state.yaml`
+
+If the apply reports merge conflicts, read the intent files:
+- `modify/src/ipc.ts.intent.md` — what changed and invariants for ipc.ts
+- `modify/container/agent-runner/src/ipc-mcp-stdio.ts.intent.md` — what changed for the MCP server
+- `modify/container/Dockerfile.intent.md` — what changed for the Dockerfile
+- `modify/container/build.sh.intent.md` — what changed for the build script
+
+### Configure environment
+
+Add to `.env` based on user's choices:
+
+```bash
+CHROME_PATH=/path/to/Google Chrome
+X_ENABLED_ACTIONS=post,like,reply,retweet,quote
+X_REQUIRE_CONFIRMATION=true
+X_MAIN_ONLY=true
 ```
 
 Check `CHROME_PATH`:
@@ -66,102 +100,6 @@ mdfind "kMDItemCFBundleIdentifier == 'com.google.Chrome'" 2>/dev/null | head -1
 which google-chrome || which chromium-browser
 ```
 
-If Chrome is not at the default location, tell the user to add to `.env`:
-```bash
-CHROME_PATH=/path/to/Google Chrome
-```
-
-### Integration Points
-
-To integrate this skill into NanoClaw, make the following modifications:
-
----
-
-**1. Host side: `src/ipc.ts`**
-
-Add import after other local imports:
-```typescript
-import { handleXIpc } from '../.claude/skills/add-x-twitter-integration/host.js';
-```
-
-Modify `processTaskIpc` function's switch statement default case:
-```typescript
-// Find:
-default:
-logger.warn({ type: data.type }, 'Unknown IPC task type');
-
-// Replace with:
-default:
-const handled = await handleXIpc(data, sourceGroup, isMain, DATA_DIR);
-if (!handled) {
-    logger.warn({ type: data.type }, 'Unknown IPC task type');
-}
-```
-
----
-
-**2. Container side: `container/agent-runner/src/ipc-mcp.ts`**
-
-Add import after `cron-parser` import:
-```typescript
-// @ts-ignore - Copied during Docker build from .claude/skills/add-x-twitter-integration/
-import { createXTools } from './skills/add-x-twitter-integration/agent.js';
-```
-
-Add to the end of tools array (before the closing `]`):
-```typescript
-    ...createXTools({ groupFolder, isMain })
-```
-
----
-
-**3. Build script: `container/build.sh`**
-
-Change build context from `container/` to project root (required to access `.claude/skills/`):
-```bash
-# Find:
-docker build -t "${IMAGE_NAME}:${TAG}" .
-
-# Replace with:
-cd "$SCRIPT_DIR/.."
-docker build -t "${IMAGE_NAME}:${TAG}" -f container/Dockerfile .
-```
-
----
-
-**4. Dockerfile: `container/Dockerfile`**
-
-First, update the build context paths (required to access `.claude/skills/` from project root):
-```dockerfile
-# Find:
-COPY agent-runner/package*.json ./
-...
-COPY agent-runner/ ./
-
-# Replace with:
-COPY container/agent-runner/package*.json ./
-...
-COPY container/agent-runner/ ./
-```
-
-Then add COPY line after `COPY container/agent-runner/ ./` and before `RUN npm run build`:
-```dockerfile
-# Copy skill MCP tools
-COPY .claude/skills/add-x-twitter-integration/agent.ts ./src/skills/add-x-twitter-integration/
-```
-
----
-
-### Configure environment
-
-Add to `.env` based on user's choices:
-
-```bash
-X_ENABLED_ACTIONS=post,like,reply,retweet,quote
-X_REQUIRE_CONFIRMATION=true
-X_MAIN_ONLY=true
-```
-
 Sync to container environment:
 
 ```bash
@@ -171,10 +109,11 @@ mkdir -p data/env && cp .env data/env/env
 ### Validate code changes
 
 ```bash
+npm test
 npm run build
 ```
 
-Build must be clean before proceeding.
+All tests must pass and build must be clean before proceeding.
 
 ## Phase 3: Setup
 
@@ -329,17 +268,19 @@ Paths relative to project root:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Container (Linux VM)                                       │
-│  └── agent.ts → MCP tool definitions (x_post, etc.)    │
-│      └── Writes IPC request to /workspace/ipc/tasks/       │
+│  └── ipc-mcp-stdio.ts → MCP tools (x_post, etc.)          │
+│      └── Writes IPC task to /workspace/ipc/tasks/          │
+│      └── Polls /workspace/ipc/x_results/ for response      │
 └──────────────────────┬──────────────────────────────────────┘
                        │ IPC (file system)
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  Host                                                       │
 │  └── src/ipc.ts → processTaskIpc()                         │
-│      └── host.ts → handleXIpc()                         │
+│      └── host.ts → handleXIpc()                            │
 │          └── spawn subprocess → scripts/*.ts               │
 │              └── Playwright → Chrome → X Website           │
+│          └── Write result → ipc/{group}/x_results/         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -349,24 +290,38 @@ Paths relative to project root:
 - **Bot browsers get blocked** - X detects and bans headless browsers and common automation fingerprints
 - **Must use user's real browser** - Reuses the user's actual Chrome on Host with real browser fingerprint to avoid detection
 - **One-time authorization** - User logs in manually once, session persists in Chrome profile for future use
+- **MCP integration** - X tools are registered as MCP tools in the container's stdio server, available as `mcp__nanoclaw__x_post`, etc.
 
 ### File Structure
 
 ```
 .claude/skills/add-x-twitter-integration/
+├── manifest.yaml     # Skill package manifest
 ├── SKILL.md          # This documentation
 ├── host.ts           # Host-side IPC handler
-├── agent.ts          # Container-side MCP tool definitions
+├── agent.ts          # Reference: tool definitions (Agent SDK format)
 ├── lib/
 │   ├── config.ts     # Centralized configuration
 │   └── browser.ts    # Playwright utilities
-└── scripts/
-    ├── setup.ts      # Interactive login
-    ├── post.ts       # Post tweet
-    ├── like.ts       # Like tweet
-    ├── reply.ts      # Reply to tweet
-    ├── retweet.ts    # Retweet
-    └── quote.ts      # Quote tweet
+├── scripts/
+│   ├── setup.ts      # Interactive login
+│   ├── post.ts       # Post tweet
+│   ├── like.ts       # Like tweet
+│   ├── reply.ts      # Reply to tweet
+│   ├── retweet.ts    # Retweet
+│   └── quote.ts      # Quote tweet
+└── modify/
+    ├── src/
+    │   ├── ipc.ts                # Host IPC with X handler
+    │   └── ipc.ts.intent.md      # Intent documentation
+    └── container/
+        ├── agent-runner/src/
+        │   ├── ipc-mcp-stdio.ts          # MCP server with X tools
+        │   └── ipc-mcp-stdio.ts.intent.md
+        ├── Dockerfile            # Container with x_results dir
+        ├── Dockerfile.intent.md
+        ├── build.sh              # Build from project root
+        └── build.sh.intent.md
 ```
 
 ## Troubleshooting
@@ -429,31 +384,32 @@ If X updates their UI, selectors in scripts may break. Current selectors:
 
 ### Container Build Issues
 
-If MCP tools not found in container:
+If X MCP tools not available in container:
 
 ```bash
-# Verify build copies skill
-./container/build.sh 2>&1 | grep -i skill
+# Rebuild container (ensure ipc-mcp-stdio.ts has X tool registrations)
+./container/build.sh
 
-# Check container has the file
-docker run nanoclaw-agent ls -la /app/src/skills/
+# Verify tools registered by checking MCP server source
+grep -c "x_post" container/agent-runner/src/ipc-mcp-stdio.ts
 ```
 
 ## Security
 
 - `data/x-browser-profile/` - Contains X session cookies (in `.gitignore`)
 - `data/x-auth.json` - Auth state marker (in `.gitignore`)
-- Only main group can use X tools by default (enforced in `agent.ts` and `host.ts`, controlled by `X_MAIN_ONLY`)
+- Only main group can use X tools by default (enforced in MCP tools and `host.ts`, controlled by `X_MAIN_ONLY`)
 - Scripts run as subprocesses with limited environment
 
 ## Removal
 
 To remove X integration:
 
-1. Remove import of `handleXIpc` from `src/ipc.ts` and revert the switch default case
-2. Remove `createXTools` import and spread from `container/agent-runner/src/ipc-mcp.ts`
-3. Remove the `COPY .claude/skills/add-x-twitter-integration/agent.ts` line from `container/Dockerfile`
-4. Revert build context changes in `container/build.sh` and `container/Dockerfile` (if no other skills need them)
-5. Remove `X_ENABLED_ACTIONS`, `X_REQUIRE_CONFIRMATION`, `X_MAIN_ONLY` from `.env` and `data/env/env`
+1. Revert `src/ipc.ts`: remove `handleXIpc` import and revert the switch default case to just log unknown types
+2. Revert `container/agent-runner/src/ipc-mcp-stdio.ts`: remove `X_RESULTS_DIR` constant, `waitForXResult` function, and all `x_*` tool registrations
+3. Revert `container/Dockerfile`: remove `/workspace/ipc/x_results` from mkdir, revert build context paths if no other skills need them
+4. Revert `container/build.sh`: revert to `cd "$SCRIPT_DIR"` and `build -t "${IMAGE_NAME}:${TAG}" .` if no other skills need project root context
+5. Remove `CHROME_PATH`, `X_ENABLED_ACTIONS`, `X_REQUIRE_CONFIRMATION`, `X_MAIN_ONLY` from `.env` and `data/env/env`
 6. Delete auth data: `rm -rf data/x-browser-profile data/x-auth.json`
-7. Rebuild: `npm run build && ./container/build.sh && launchctl kickstart -k gui/$(id -u)/com.nanoclaw` (macOS) or `npm run build && ./container/build.sh && systemctl --user restart nanoclaw` (Linux)
+7. Remove `x-twitter-integration` from `.nanoclaw/state.yaml` applied_skills
+8. Rebuild: `npm run build && ./container/build.sh && launchctl kickstart -k gui/$(id -u)/com.nanoclaw` (macOS) or `npm run build && ./container/build.sh && systemctl --user restart nanoclaw` (Linux)

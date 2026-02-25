@@ -1,0 +1,22 @@
+skill: x-twitter-integration
+version: 1.0.0
+description: "X (Twitter) integration via browser automation"
+core_version: 0.1.0
+adds: []
+modifies:
+  - src/ipc.ts
+  - container/agent-runner/src/ipc-mcp-stdio.ts
+  - container/Dockerfile
+  - container/build.sh
+structured:
+  npm_dependencies:
+    playwright: "^1.42.0"
+    dotenv-cli: "^7.4.0"
+  env_additions:
+    - CHROME_PATH
+    - X_ENABLED_ACTIONS
+    - X_REQUIRE_CONFIRMATION
+    - X_MAIN_ONLY
+conflicts: []
+depends: []
+test: "npm run build"
